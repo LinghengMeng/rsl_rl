@@ -97,11 +97,19 @@ class AbstractActorCritic(Agent):
         try:
             actor_input_size = dimensions["actor_observations"]
             critic_input_size = dimensions["critic_observations"]
+            # Get the number of reward term which will be used to initialize value function
+            reward_term_num = dimensions["reward_term_num"]
         except KeyError:
             actor_input_size = dimensions["observations"]
             critic_input_size = dimensions["observations"]
         self._actor_input_size = actor_input_size + _actor_input_size_delta
         self._critic_input_size = critic_input_size + self._action_size + _critic_input_size_delta
+        self._reward_term_num = reward_term_num
+
+        # Check reward term number is equal to the head number of critic
+        for dim, act in zip(critic_hidden_dims, critic_activations):
+            if isinstance(dim, list):
+                assert len(dim) == len(act) == reward_term_num
 
         self._register_actor_network_kwargs(
             activations=actor_activations,
@@ -239,6 +247,11 @@ class AbstractActorCritic(Agent):
             "rewards": squeeze_preserve_batch(rewards),
             "timeouts": self._extract_timeouts(next_environment_info),
         }
+
+        # Read each reward term to transition
+        for reward_term_key, reward_term_value in next_environment_info['reward_term_buf_dict'].items():
+            transition['reward_term_{}'.format(reward_term_key)] = reward_term_value
+        
         transition.update(data)
 
         for key, value in transition.items():

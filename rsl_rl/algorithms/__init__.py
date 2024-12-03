@@ -4,6 +4,7 @@ from .ddpg import DDPG
 from .dppo import DPPO
 from .dsac import DSAC
 from .ppo import PPO
+from .ppo_hra import HraPPO
 from .sac import SAC
 from .td3 import TD3
 

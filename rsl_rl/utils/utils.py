@@ -27,6 +27,8 @@ def environment_dimensions(env):
         dims["critic_observations"] = dims["observations"]
 
     dims["actions"] = env.num_actions
+    # Get the number of reward terms
+    dims["reward_term_num"] = env.num_reward_terms
 
     return dims
 
