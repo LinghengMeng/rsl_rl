@@ -60,19 +60,21 @@ def make_wandb_cb(init_kwargs):
     check_complete = make_final_cb(lambda *_: run.finish())
 
     def cb(runner, stat):
-        mean_reward = sum(stat["returns"]) / len(stat["returns"]) if len(stat["returns"]) > 0 else 0.0
+        mean_reward = sum(stat["returns"]) / len(stat["returns"]) if len(stat["returns"]) > 0 else 0.0    # Take the average among all environments
+        log_dict = {}
+        for stat_key, stat_item in stat.items():
+            if 'returns_separate_terms_' in stat_key:
+                log_dict['mean_{}'.format(stat_key)] = sum(stat_item) / len(stat["returns"]) if len(stat["returns"]) > 0 else 0.0 
+
         mean_steps = sum(stat["lengths"]) / len(stat["lengths"]) if len(stat["lengths"]) > 0 else 0.0
         total_steps = stat["current_iteration"] * runner.env.num_envs * runner._num_steps_per_env
         training_time = stat["training_time"]
-
-        run.log(
-            {
-                "mean_rewards": mean_reward,
-                "mean_steps": mean_steps,
-                "training_steps": total_steps,
-                "training_time": training_time,
-            }
-        )
+        
+        log_dict["mean_rewards"] = mean_reward
+        log_dict["mean_steps"] = mean_steps
+        log_dict["training_steps"] = total_steps
+        log_dict["training_time"] = training_time
+        run.log(log_dict)
 
         check_complete(runner, stat)
 

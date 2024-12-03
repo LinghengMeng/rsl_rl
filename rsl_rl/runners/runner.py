@@ -229,8 +229,15 @@ class Runner:
             "training_time": 0,
             "update_time": None,
         }
+        for term in self.env.env.reward_manager._term_names: 
+            self._episode_statistics["returns_separate_terms_{}".format(term)] = []
+            self._episode_statistics["returns_separate_terms_unweighted_{}".format(term)] = []
+            
         self._current_episode_lengths = torch.zeros(self.env.num_envs, dtype=torch.float)
         self._current_cumulative_rewards = torch.zeros(self.env.num_envs, dtype=torch.float)
+        # Get reward term names
+        self._current_cumulative_rewards_separate_terms = {term: torch.zeros(self.env.num_envs, dtype=torch.float) for term in self.env.env.reward_manager._term_names}
+        self._current_cumulative_rewards_separate_terms_unweighted = {term: torch.zeros(self.env.num_envs, dtype=torch.float) for term in self.env.env.reward_manager._term_names}
 
         self.train_mode()
 
@@ -315,17 +322,38 @@ class Runner:
         # Gather statistics
         if "episode" in self._env_info:
             self._episode_statistics["info"].append(self._env_info["episode"])
-        dones_idx = (dones + next_env_info["time_outs"]).nonzero().cpu()
+        dones_idx = (dones + next_env_info["time_outs"]).nonzero().cpu()    # An episode is a trajectory that is either done or reaches maximum time step 
         self._current_episode_lengths += 1
         self._current_cumulative_rewards += rewards.cpu()
+        # Calculate accumulative separate rewards
+        for term in self._current_cumulative_rewards_separate_terms:
+            self._current_cumulative_rewards_separate_terms[term] = next_env_info['reward_term_buf_dict'][term].cpu()
+            self._current_cumulative_rewards_separate_terms_unweighted[term] = next_env_info['reward_term_unweighted_buf_dict'][term].cpu()
 
         completed_lengths = self._current_episode_lengths[dones_idx][:, 0].cpu()
         completed_returns = self._current_cumulative_rewards[dones_idx][:, 0].cpu()
+        # Get completed return for each reward term
+        completed_returns_separate_terms = {}
+        completed_returns_separate_terms_unweighted = {}
+        for term in self._current_cumulative_rewards_separate_terms: 
+            completed_returns_separate_terms[term] = self._current_cumulative_rewards_separate_terms[term][dones_idx][:, 0].cpu()
+            completed_returns_separate_terms_unweighted[term] = self._current_cumulative_rewards_separate_terms_unweighted[term][dones_idx][:, 0].cpu()
+        
         self._episode_statistics["lengths"].extend(completed_lengths.tolist())
         self._episode_statistics["returns"].extend(completed_returns.tolist())
+        # Save returns from all environments
+        for term in self._current_cumulative_rewards_separate_terms: 
+            self._episode_statistics["returns_separate_terms_{}".format(term)].extend(completed_returns_separate_terms[term].tolist())
+            self._episode_statistics["returns_separate_terms_unweighted_{}".format(term)].extend(completed_returns_separate_terms_unweighted[term].tolist())
+
+        # Reset
         self._current_episode_lengths[dones_idx] = 0.0
         self._current_cumulative_rewards[dones_idx] = 0.0
-
+        # Reset cumulative reward for each reward term
+        for term in self._current_cumulative_rewards_separate_terms:
+            self._current_cumulative_rewards_separate_terms[term][dones_idx] = 0.0
+            self._current_cumulative_rewards_separate_terms_unweighted[term][dones_idx] = 0.0
+        
         self._episode_statistics["current_actions"] = actions
         self._episode_statistics["current_observations"] = self._obs
         self._episode_statistics["sample_count"] = self.agent.storage.sample_count
@@ -471,7 +499,7 @@ class Runner:
         total_time = stat["total_time"]
         collection_percentage = 100 * collection_time / total_time
         update_percentage = 100 * update_time / total_time
-
+        
         if prefix == "":
             prefix = "learn" if stat["storage_initialized"] else "init"
         self._log_progress(stat, clear_line=False, prefix=prefix)
