@@ -41,6 +41,10 @@ class HraPPO(AbstractActorCritic):
         schedule: str = "fixed",
         target_kl: float = 0.01,
         value_coeff: float = 1.0,
+        actor_loss_type: str  = 'actor_loss_orig',
+        actor_loss_mixed_weight: float = 0.1,
+        value_loss_type: str = 'actor_loss_orig',
+        value_loss_mixed_weight: float = 0.1,
         **kwargs,
     ):
         """
@@ -55,6 +59,10 @@ class HraPPO(AbstractActorCritic):
             schedule (str): The learning rate schedule. Can be "fixed" or "adaptive". Defaults to "fixed".
             target_kl (float): The target KL-divergence for the adaptive learning rate schedule.
             value_coeff (float): The coefficient for the value function loss in the PPO objective.
+            actor_loss_type (str): default='actor_loss_orig'  # Options: 'actor_loss_orig', 'actor_loss_separate_only', 'actor_loss_mixed'
+            actor_loss_mixed_weight (float): default=0.1        # weight for separate surrogate in actor_loss_mixed
+            value_loss_type  (str): default='actor_loss_orig'  # Options: 'value_loss_orig', 'value_loss_separate_only', 'value_loss_mixed'
+            value_loss_mixed_weight (float): default=0.1        # weight for separate surrogate in value_loss_mixed
         """
         kwargs["batch_size"] = env.num_envs
         kwargs["return_steps"] = 1
@@ -73,7 +81,13 @@ class HraPPO(AbstractActorCritic):
         self._schedule = schedule
         self._target_kl = target_kl
         self._value_coeff = value_coeff
-
+        # Hyper-params for loss function
+        self.actor_loss_type = actor_loss_type  # choose actor loss
+        self.actor_loss_mixed_weight = actor_loss_mixed_weight  # weight for separate surrogate in actor_loss_mixed
+        self.value_loss_type = value_loss_type  # choose value loss
+        self.value_loss_mixed_weight = value_loss_mixed_weight  # weight for separate surrogate in value_loss_mixed
+        import pdb; pdb.set_trace()
+        
         self._register_serializable(
             "_clip_ratio",
             "_entropy_coeff",
@@ -280,8 +294,15 @@ class HraPPO(AbstractActorCritic):
         separate_surrogate_clipped = batch["separate_normalized_advantages"] * separate_ratio.clamp(1.0 - self._clip_ratio, 1.0 + self._clip_ratio)
         separate_surrogate_loss = -torch.min(separate_surrogate, separate_surrogate_clipped).mean()
         
-        
-        return torch.mean(torch.stack([surrogate_loss, 0.1*separate_surrogate_loss])) # separate_surrogate_loss # surrogate_loss
+        # Choose actor loss
+        if self.actor_loss_type == 'actor_loss_orig':
+            return torch.mean(surrogate_loss) # surrogate_loss
+        elif self.actor_loss_type == 'actor_loss_separate_only':
+            return torch.mean(separate_surrogate_loss) # separate_surrogate_loss # surrogate_loss
+        elif self.actor_loss_type == 'actor_loss_mixed':
+            return torch.mean(torch.stack([surrogate_loss, self.actor_loss_mixed_weight*separate_surrogate_loss])) # separate_surrogate_loss # surrogate_loss
+        else:
+            raise ValueError('Please set actor_loss_type: {} correctly!'.format(self.actor_loss_type))
 
     @Benchmarkable.register
     def _compute_value_loss(self, batch: Dict[str, torch.Tensor]) -> torch.Tensor:
@@ -315,7 +336,16 @@ class HraPPO(AbstractActorCritic):
         value_loss = torch.max(value_losses, value_losses_clipped).mean()
         separate_value_loss = torch.max(separate_value_losses, separate_value_losses_clipped).mean()
 
-        return torch.mean(torch.stack([value_loss, separate_value_loss])) # value_loss
+        # Choose critic loss
+        if self.value_loss_type == 'value_loss_orig':
+            return torch.mean(value_loss) # value_loss
+        elif self.value_loss_type == 'value_loss_separate_only':
+            return torch.mean(separate_value_loss) # value_loss
+        elif self.value_loss_type == 'value_loss_mixed':
+            return torch.mean(torch.stack([value_loss, self.value_loss_mixed_weight*separate_value_loss])) # value_loss
+        else:
+            raise ValueError('Please set value_loss_type: {} correctly!'.format(self.value_loss_type))
+
 
     def _critic_input(self, observations, actions=None) -> torch.Tensor:
         return observations
