@@ -86,7 +86,6 @@ class HraPPO(AbstractActorCritic):
         self.actor_loss_mixed_weight = actor_loss_mixed_weight  # weight for separate surrogate in actor_loss_mixed
         self.value_loss_type = value_loss_type  # choose value loss
         self.value_loss_mixed_weight = value_loss_mixed_weight  # weight for separate surrogate in value_loss_mixed
-        import pdb; pdb.set_trace()
         
         self._register_serializable(
             "_clip_ratio",
