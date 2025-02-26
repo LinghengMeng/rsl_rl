@@ -199,6 +199,11 @@ class Runner:
         self.eval_mode()
 
         return self.agent.get_inference_policy(device)
+    
+    def get_corrupted_inference_policy(self, device=None, act_noise_std=None):
+        self.eval_mode()
+        policy = self.agent.get_corrupted_inference_policy(device, act_noise_std=act_noise_std)
+        return policy
 
     def learn(
         self, iterations: Union[int, None] = None, timeout: Union[int, None] = None, return_epochs: int = 100
@@ -235,7 +240,7 @@ class Runner:
             
         self._current_episode_lengths = torch.zeros(self.env.num_envs, dtype=torch.float)
         self._current_cumulative_rewards = torch.zeros(self.env.num_envs, dtype=torch.float)
-        # Get reward term names
+        # Get reward term names (same)
         self._current_cumulative_rewards_separate_terms = {term: torch.zeros(self.env.num_envs, dtype=torch.float) for term in self.env.env.reward_manager._term_names}
         self._current_cumulative_rewards_separate_terms_unweighted = {term: torch.zeros(self.env.num_envs, dtype=torch.float) for term in self.env.env.reward_manager._term_names}
 
@@ -301,7 +306,7 @@ class Runner:
             actions, data = self.agent.draw_random_actions(self._obs, self._env_info)
 
         next_obs, rewards, dones, next_env_info = self.env.step(actions)
-
+        
         self._dataset.append(
             self.agent.process_transition(
                 self._obs.clone(),
@@ -331,6 +336,7 @@ class Runner:
             self._current_cumulative_rewards_separate_terms_unweighted[term] = next_env_info['reward_term_unweighted_buf_dict'][term].cpu()
 
         completed_lengths = self._current_episode_lengths[dones_idx][:, 0].cpu()
+        # completed return for mixed reward
         completed_returns = self._current_cumulative_rewards[dones_idx][:, 0].cpu()
         # Get completed return for each reward term
         completed_returns_separate_terms = {}
@@ -411,7 +417,6 @@ class Runner:
             "data": data,
             "iteration": self._current_learning_iteration,
         }
-
         os.makedirs(os.path.dirname(path), exist_ok=True)
         torch.save(content, path)
 
