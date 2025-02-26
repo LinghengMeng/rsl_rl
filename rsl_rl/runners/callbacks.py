@@ -64,8 +64,8 @@ def make_wandb_cb(init_kwargs):
         log_dict = {}
         for stat_key, stat_item in stat.items():
             if 'returns_separate_terms_' in stat_key:
-                log_dict['mean_{}'.format(stat_key)] = sum(stat_item) / len(stat["returns"]) if len(stat["returns"]) > 0 else 0.0 
-
+                log_dict['mean_{}'.format(stat_key)] = sum(stat_item) / len(stat_item) if len(stat_item) > 0 else 0.0 
+        
         mean_steps = sum(stat["lengths"]) / len(stat["lengths"]) if len(stat["lengths"]) > 0 else 0.0
         total_steps = stat["current_iteration"] * runner.env.num_envs * runner._num_steps_per_env
         training_time = stat["training_time"]
