@@ -215,6 +215,31 @@ class AbstractActorCritic(Agent):
             return actions
 
         return policy
+    
+    def get_corrupted_inference_policy(self, device=None, act_noise_std=None) -> Callable:
+        self.to(device)
+        self.eval_mode()
+
+        if self.actor.recurrent:
+            self.actor.reset_full_hidden_state(batch_size=self.env.num_envs)
+
+        if self.critic.recurrent:
+            self.critic.reset_full_hidden_state(batch_size=self.env.num_envs)
+
+        def policy(obs, env_info=None):
+            with torch.inference_mode():
+                obs, _ = self._process_observations(obs, env_info)
+                act = self.actor.forward(obs)    # default compute_std: bool = False
+                # add noise to action
+                if act_noise_std is not None and act_noise_std > 0:
+                    act_noise_dist = torch.distributions.normal.Normal(0, act_noise_std)
+                    act_noise = act_noise_dist.sample(act.shape)
+                    act = act + act_noise.to(act.get_device())
+                actions = self._process_actions(act)
+
+            return actions
+
+        return policy
 
     def process_transition(
         self,
@@ -248,9 +273,12 @@ class AbstractActorCritic(Agent):
             "timeouts": self._extract_timeouts(next_environment_info),
         }
 
-        # Read each reward term to transition
+        # Read each weighted reward term to transition
         for reward_term_key, reward_term_value in next_environment_info['reward_term_buf_dict'].items():
-            transition['reward_term_{}'.format(reward_term_key)] = reward_term_value
+            transition['weighted_reward_term_{}'.format(reward_term_key)] = reward_term_value
+        # Read each unweighted reward term to transition
+        for reward_term_key, unweighted_reward_term_value in next_environment_info['reward_term_unweighted_buf_dict'].items():
+            transition['unweighted_reward_term_{}'.format(reward_term_key)] = unweighted_reward_term_value
         
         transition.update(data)
 
