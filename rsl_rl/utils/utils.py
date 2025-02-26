@@ -78,13 +78,25 @@ def unpad_trajectories(trajectories, masks):
 
 
 def store_code_state(logdir, repositories):
+    git_log_dir = os.path.join(logdir, "git")
+    os.makedirs(git_log_dir, exist_ok=True)
+    file_paths = []
     for repository_file_path in repositories:
         repo = git.Repo(repository_file_path, search_parent_directories=True)
         repo_name = pathlib.Path(repo.working_dir).name
         t = repo.head.commit.tree
+        diff_file_name = os.path.join(git_log_dir, f"{repo_name}.diff")
+        # check if the diff file already exists
+        if os.path.isfile(diff_file_name):
+            continue
+        # write the diff file
+        print(f"Storing git diff for '{repo_name}' in: {diff_file_name}")
         content = f"--- git status ---\n{repo.git.status()} \n\n\n--- git diff ---\n{repo.git.diff(t)}"
-        with open(os.path.join(logdir, f"{repo_name}_git.diff"), "x", encoding="utf-8") as f:
+        with open(diff_file_name, "x", encoding="utf-8") as f:
             f.write(content)
+        # add the file path to the list of files to be uploaded
+        file_paths.append(diff_file_name)
+    return file_paths
 
 
 def seed(s=None):
