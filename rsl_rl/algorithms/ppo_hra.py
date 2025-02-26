@@ -1,6 +1,7 @@
 import torch
 from torch import nn, optim
-from typing import Any, Dict, Tuple, Type, Union
+from typing import Any, Dict, Tuple, Type, Union, Callable
+import re
 
 from rsl_rl.algorithms.actor_critic import AbstractActorCritic
 from rsl_rl.env import VecEnv
@@ -10,6 +11,11 @@ from rsl_rl.modules import GaussianNetwork, Network, MultiHeadNetwork
 from rsl_rl.storage.rollout_storage import RolloutStorage
 from rsl_rl.storage.storage import Dataset
 
+def default_weighted_rewards_callback(separate_unweighted_rewards, orig_separate_weights):
+    """
+    simply use the original weights
+    """
+    return separate_unweighted_rewards * orig_separate_weights
 
 class HraPPO(AbstractActorCritic):
     """Proximal Policy Optimization algorithm.
@@ -45,6 +51,7 @@ class HraPPO(AbstractActorCritic):
         actor_loss_mixed_weight: float = 0.1,
         value_loss_type: str = 'actor_loss_orig',
         value_loss_mixed_weight: float = 0.1,
+        weighted_rewards_callback: callable = default_weighted_rewards_callback,
         **kwargs,
     ):
         """
@@ -86,6 +93,7 @@ class HraPPO(AbstractActorCritic):
         self.actor_loss_mixed_weight = actor_loss_mixed_weight  # weight for separate surrogate in actor_loss_mixed
         self.value_loss_type = value_loss_type  # choose value loss
         self.value_loss_mixed_weight = value_loss_mixed_weight  # weight for separate surrogate in value_loss_mixed
+        self.weighted_rewards_callback = weighted_rewards_callback # callback to transform weights and produce weighted rewards
         
         self._register_serializable(
             "_clip_ratio",
@@ -173,9 +181,11 @@ class HraPPO(AbstractActorCritic):
             transition["critic_state_c"] = self.critic.hidden_state[1].detach()
         
         # Forward passing return both aggregated values and separate values for each reward term
-        #   Note: the value is for the current observation, rahter than the next observation.
+        #   Note: 
+        #       1. the value is for the current observation, rahter than the next observation.
+        #       2. if unweighted reward terms are used, then the values are for each unweighted reward terms
         values, separate_values = self.critic.forward(transition["critic_observations"])
-        transition["values"] = values.detach()
+        transition["values"] = values.detach()    # values is simply the summation of separate_values.
         transition["separate_values"] = separate_values.detach()
 
         if self.recurrent:
@@ -287,11 +297,19 @@ class HraPPO(AbstractActorCritic):
         surrogate = batch["normalized_advantages"] * ratio
         surrogate_clipped = batch["normalized_advantages"] * ratio.clamp(1.0 - self._clip_ratio, 1.0 + self._clip_ratio)
         surrogate_loss = -torch.min(surrogate, surrogate_clipped).mean()
-        # surrogate for each head
+        # surrogate for each head of Hybrid-reward Architecture (HRA)
         separate_ratio = ratio.unsqueeze(1).repeat(1, self._reward_term_num)
-        separate_surrogate = batch["separate_normalized_advantages"] * separate_ratio
-        separate_surrogate_clipped = batch["separate_normalized_advantages"] * separate_ratio.clamp(1.0 - self._clip_ratio, 1.0 + self._clip_ratio)
+        # # weighted
+        # separate_surrogate = batch["separate_normalized_advantages"] * separate_ratio
+        # separate_surrogate_clipped = batch["separate_normalized_advantages"] * separate_ratio.clamp(1.0 - self._clip_ratio, 1.0 + self._clip_ratio)
+        # unweighted
+        separate_surrogate = batch["separate_normalized_unweighted_advantages"] * separate_ratio
+        separate_surrogate_clipped = batch["separate_normalized_unweighted_advantages"] * separate_ratio.clamp(1.0 - self._clip_ratio, 1.0 + self._clip_ratio)
         separate_surrogate_loss = -torch.min(separate_surrogate, separate_surrogate_clipped).mean()
+        # Test only update policy on a single term
+        # act_dim_idx = 2
+        # separate_surrogate_loss = -torch.min(separate_surrogate[act_dim_idx], separate_surrogate_clipped[act_dim_idx]).mean()
+        # import pdb; pdb.set_trace()
         
         # Choose actor loss
         if self.actor_loss_type == 'actor_loss_orig':
@@ -316,6 +334,7 @@ class HraPPO(AbstractActorCritic):
 
             evaluation = trajectories_to_transitions(trajectory_evaluations, data)
         else:
+            # evaluation is the sum of the evaluation_head
             evaluation, evaluation_head = self.critic.forward(batch["critic_observations"])
 
         # Clip evaluation to only allow it to be self._clip_ratio greater or lower than the next state value
@@ -325,25 +344,41 @@ class HraPPO(AbstractActorCritic):
         returns = batch["advantages"] + batch["values"]    
         value_losses = (evaluation - returns).pow(2)
         value_losses_clipped = (value_clipped - returns).pow(2)
-
+        
         # Calculate loss for each head
         separate_value_clipped = batch['separate_values'] + (evaluation_head - batch['separate_values']).clamp(-self._clip_ratio, self._clip_ratio)
-        separate_returns = batch["separate_advantages"] + batch['separate_values']
-        separate_value_losses = (evaluation_head - separate_returns).pow(2)
-        separate_value_losses_clipped = (separate_value_clipped - separate_returns).pow(2)
+        
+        separate_weighted_returns = batch["separate_weighted_advantages"] + batch['separate_values']
+        separate_weigted_value_losses = (evaluation_head - separate_weighted_returns).pow(2)
+        separate_weigted_value_losses_clipped = (separate_value_clipped - separate_weighted_returns).pow(2)
+
+        separate_weights = torch.as_tensor(list(self.env.env.reward_term_weight_dict.values()), device=self.device)
+        separate_unweighted_returns = batch["separate_unweighted_advantages"] + batch['separate_values']
+        separate_unweigted_value_losses = (evaluation_head - separate_unweighted_returns).pow(2)
+        separate_unweigted_value_losses_clipped = (separate_value_clipped - separate_unweighted_returns).pow(2)
         
         value_loss = torch.max(value_losses, value_losses_clipped).mean()
-        separate_value_loss = torch.max(separate_value_losses, separate_value_losses_clipped).mean()
+        separate_weigted_value_loss = torch.max(separate_weigted_value_losses, separate_weigted_value_losses_clipped).mean()
+        separate_unweigted_value_loss = torch.max(separate_unweigted_value_losses, separate_unweigted_value_losses_clipped).mean()
+
+        # separate_unweigted_value_loss = separate_weights.pow(2) * torch.max(separate_unweigted_value_losses, separate_unweigted_value_losses_clipped).mean()
+        separate_value_loss = separate_unweigted_value_loss
+        # import pdb; pdb.set_trace()
 
         # Choose critic loss
         if self.value_loss_type == 'value_loss_orig':
-            return torch.mean(value_loss) # value_loss
+            loss = value_loss
         elif self.value_loss_type == 'value_loss_separate_only':
-            return torch.mean(separate_value_loss) # value_loss
+            loss = torch.mean(separate_value_loss)
         elif self.value_loss_type == 'value_loss_mixed':
-            return torch.mean(torch.stack([value_loss, self.value_loss_mixed_weight*separate_value_loss])) # value_loss
+            loss = torch.mean(torch.stack([value_loss, self.value_loss_mixed_weight*separate_value_loss])) # value_loss
         else:
             raise ValueError('Please set value_loss_type: {} correctly!'.format(self.value_loss_type))
+        stat = {'value_loss': value_loss, 
+                'separate_weigted_value_loss': separate_weigted_value_loss,
+                'separate_unweigted_value_loss': separate_unweigted_value_loss}
+        # import pdb; pdb.set_trace()
+        return loss
 
 
     def _critic_input(self, observations, actions=None) -> torch.Tensor:
@@ -383,17 +418,49 @@ class HraPPO(AbstractActorCritic):
         values = torch.stack([entry["values"] for entry in dataset])
 
         # Stack separate reward terms with shape (num_step_per_env, num_env, num_reward_term)
-        reward_term_key_list = [key for key in dataset[0].keys() if 'reward_term' in key]
-        rer_term_list = []
-        for rew_term in reward_term_key_list:
-            tmp_rew_term = torch.stack([entry[rew_term] for entry in dataset])
-            rer_term_list.append(tmp_rew_term)
-        separate_rewards = torch.stack(rer_term_list, axis=2)
+        weighted_reward_term_key_list = [key for key in dataset[0].keys() if bool(re.match('weighted_reward_term*', key))]      # Stack weighted reward terms
+        unweighted_reward_term_key_list = [key for key in dataset[0].keys() if bool(re.match('unweighted_reward_term*', key))]  # Stack unweighted reward terms
+        
+        # Check if the reward terms are matched in terms of both content and order.
+        weighted_term_list = [tmp_term_key.replace('weighted_reward_term_', '') for tmp_term_key in weighted_reward_term_key_list]
+        unweighted_term_list = [tmp_term_key.replace('unweighted_reward_term_', '') for tmp_term_key in unweighted_reward_term_key_list]
+        reward_term_list = list(self.env.env.reward_term_weight_dict.keys())
+        if not weighted_term_list == unweighted_term_list == reward_term_list:
+            raise ValueError('weighted_term_list={}, unweighted_term_list={}, reward_term_list={} are not matched!'.format(weighted_term_list, unweighted_term_list, reward_term_list))
+
+        # Stack weighted reward terms
+        weighted_reward_term_list = []
+        for weighted_rew_term in weighted_reward_term_key_list:
+            tmp_weighted_rew_term = torch.stack([entry[weighted_rew_term] for entry in dataset])    # Stack num_step_per_env
+            weighted_reward_term_list.append(tmp_weighted_rew_term)
+        separate_weighted_rewards = torch.stack(weighted_reward_term_list, axis=2)
+        
+        # Stack unweighted reward terms
+        unweighted_reward_term_list = []
+        for unweighted_rew_term in unweighted_reward_term_key_list:
+            tmp_unweighted_rew_term = torch.stack([entry[unweighted_rew_term] for entry in dataset]) # Stack num_step_per_env
+            unweighted_reward_term_list.append(tmp_unweighted_rew_term)
+        separate_unweighted_rewards = torch.stack(unweighted_reward_term_list, axis=2)
+        
+        # Get original weights pre-defined in the task
+        orig_separate_weights = torch.as_tensor(list(self.env.env.reward_term_weight_dict.values()), device=self.device)
+
+        # Get transformed weights and reweighted reward based on the transformed weights
+        #   Note: the default one is using the original weights
+        separate_reweighted_rewards = self.weighted_rewards_callback(separate_unweighted_rewards, orig_separate_weights)
+        reweighted_rewards = separate_reweighted_rewards.sum(axis=-1)
+
+        # Set the value that used to calculate advantage
+        rewards = reweighted_rewards
+        separate_unweighted_rewards = separate_reweighted_rewards
+
+        # separate_values are calculated in self.process_transition(), corresponding to the 
+        #   predicted values for each reward terms either weighted or unweighted.
         separate_values = torch.stack([entry["separate_values"] for entry in dataset])
 
         # Repeate dones and timeouts for each reward term
-        separate_dones = dones.unsqueeze(2).repeat(1, 1, self._reward_term_num)
-        separate_timeouts = timeouts.unsqueeze(2).repeat(1, 1, self._reward_term_num)
+        separate_dones = dones.unsqueeze(2).repeat(1, 1, self._reward_term_num)         # Repeate the same done for each reward term
+        separate_timeouts = timeouts.unsqueeze(2).repeat(1, 1, self._reward_term_num)   # Repeate the same timeout for each reward term
 
         # We could alternatively compute the next hidden state from the current state and hidden state. But this
         # (storing the hidden state when evaluating the action in process_transition) is computationally more efficient
@@ -405,41 +472,60 @@ class HraPPO(AbstractActorCritic):
         
         # About dataset:
         #   len(dataset) is the number of steps collected from each environment, so dataset[-1] corresponds to the last step.
-        #   dataset[0]['rewards'] has the rewards collected from all environments
-        final_values, final_values_head = self.critic.forward(dataset[-1]["next_critic_observations"], **critic_kwargs)
+        #   dataset[0]['rewards'] has the rewards collected from all environments in the 1st step
+        final_values, final_values_head = self.critic.forward(dataset[-1]["next_critic_observations"], **critic_kwargs)  # predicted value for the last observation
         next_values = torch.cat((values[1:], final_values.unsqueeze(0)), dim=0)
         # Form the next values for each head
         separate_next_values = torch.cat((separate_values[1:], final_values_head.unsqueeze(0)), dim=0)
         
-        rewards += self.gamma * timeouts * values    # For not timeout, rweards == rewards. Q: Not clear whey do this?
-        deltas = (rewards + (1 - dones).float() * self.gamma * next_values - values).reshape(-1, self.env.num_envs)
+        # Note: If timeout==1, done will be set to 1, so we need to incorporate the value into reward.
+        rewards += self.gamma * timeouts * values    # For not timeout, rweards == rewards. Q: Not clear whey do this? If timeout use the value as the estimate of accumulated reward
+        deltas = (rewards + (1 - dones).float() * self.gamma * next_values - values).reshape(-1, self.env.num_envs)  # delata = Q(s,a) - v(s) = r + gamma * v(s') - v(s)
 
         # Calculate delta for each head
-        separate_rewards += self.gamma * separate_timeouts * separate_values    # For not timeout, rweards == rewards. Q: Not clear whey do this?
-        separate_deltas = (separate_rewards + (1 - separate_dones).float() * self.gamma * separate_next_values - separate_values).reshape(-1, self.env.num_envs, self._reward_term_num)
+        separate_weighted_rewards += self.gamma * separate_timeouts * separate_values    # For not timeout, rweards == rewards. Q: Not clear whey do this?
+        separate_weighted_deltas = (separate_weighted_rewards + (1 - separate_dones).float() * self.gamma * separate_next_values - separate_values).reshape(-1, self.env.num_envs, self._reward_term_num)
+        
+        # Note: test add weights for bootstrapped value
+        separate_unweighted_rewards += self.gamma * separate_timeouts * separate_values    # For not timeout, rweards == rewards. Q: Not clear whey do this?
+        separate_unweighted_deltas = (separate_unweighted_rewards + (1 - separate_dones).float() * self.gamma * separate_next_values - separate_values).reshape(-1, self.env.num_envs, self._reward_term_num)
+
+        # # Instead of multiplying weights here, it's better to multiply weights once retriving the unweighted reward and keep everyting else the same for weighted and unweighted reward.
+        # separate_weights = torch.as_tensor(list(self.env.env.reward_term_weight_dict.values()), device=self.device)
+        # separate_unweighted_rewards += separate_weights * self.gamma * separate_timeouts * separate_values
+        # separate_unweighted_deltas = (separate_unweighted_rewards + separate_weights * (1 - separate_dones).float() * self.gamma * separate_next_values - separate_values).reshape(-1, self.env.num_envs, self._reward_term_num)
+
 
         advantages = torch.zeros((len(dataset) + 1, self.env.num_envs), device=self.device)
-        separate_advantages = torch.zeros((len(dataset) + 1, self.env.num_envs, self._reward_term_num), device=self.device)
+        separate_weighted_advantages = torch.zeros((len(dataset) + 1, self.env.num_envs, self._reward_term_num), device=self.device)
+        separate_unweighted_advantages = torch.zeros((len(dataset) + 1, self.env.num_envs, self._reward_term_num), device=self.device)
         for step in reversed(range(len(dataset))):
             advantages[step] = (
                 deltas[step] + (1 - dones[step]).float() * self.gamma * self._gae_lambda * advantages[step + 1]
             )
             # Calculate advantage for each head
-            separate_advantages[step] = (
-                separate_deltas[step] + (1 - separate_dones[step]).float() * self.gamma * self._gae_lambda * separate_advantages[step + 1]
+            separate_weighted_advantages[step] = (
+                separate_weighted_deltas[step] + (1 - separate_dones[step]).float() * self.gamma * self._gae_lambda * separate_weighted_advantages[step + 1]
+            )
+            separate_unweighted_advantages[step] = (
+                separate_unweighted_deltas[step] + (1 - separate_dones[step]).float() * self.gamma * self._gae_lambda * separate_unweighted_advantages[step + 1]
             )
         
         advantages = advantages[:-1]
-        separate_advantages = separate_advantages[:-1]
+        separate_weighted_advantages = separate_weighted_advantages[:-1]
+        separate_unweighted_advantages = separate_unweighted_advantages[:-1]
 
         amean, astd = advantages.mean(), torch.nan_to_num(advantages.std())
-        separate_amean, separate_astd = separate_advantages.mean(dim=[0,1]), torch.nan_to_num(separate_advantages.std(dim=[0,1]))
+        separate_weighted_amean, separate_weighted_astd = separate_weighted_advantages.mean(dim=[0,1]), torch.nan_to_num(separate_weighted_advantages.std(dim=[0,1]))
+        separate_unweighted_amean, separate_unweighted_astd = separate_unweighted_advantages.mean(dim=[0,1]), torch.nan_to_num(separate_unweighted_advantages.std(dim=[0,1]))
         for step in range(len(dataset)):
             dataset[step]["advantages"] = advantages[step]
             dataset[step]["normalized_advantages"] = (advantages[step] - amean) / (astd + 1e-8)
             
-            dataset[step]["separate_advantages"] = separate_advantages[step]
-            dataset[step]["separate_normalized_advantages"] = (separate_advantages[step] - separate_amean) / (separate_astd + 1e-8)
+            dataset[step]["separate_weighted_advantages"] = separate_weighted_advantages[step]
+            dataset[step]["separate_normalized_weighted_advantages"] = (separate_weighted_advantages[step] - separate_weighted_amean) / (separate_weighted_astd + 1e-8)
+            dataset[step]["separate_unweighted_advantages"] = separate_unweighted_advantages[step]
+            dataset[step]["separate_normalized_unweighted_advantages"] = (separate_unweighted_advantages[step] - separate_unweighted_amean) / (separate_unweighted_astd + 1e-8)
 
         return dataset
 
